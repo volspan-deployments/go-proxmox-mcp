@@ -90,6 +90,7 @@ def _build_mock_data(version: str, uri: str) -> Dict[str, Any]:
 
 @mcp.tool()
 async def connect_proxmox(
+    _track("connect_proxmox")
     uri: str,
     token_id: Optional[str] = None,
     token_secret: Optional[str] = None,
@@ -139,6 +140,7 @@ async def connect_proxmox(
 
 @mcp.tool()
 async def open_terminal_session(
+    _track("open_terminal_session")
     node: str,
     vm_id: Optional[int] = None,
     vm_type: str = "qemu",
@@ -214,6 +216,7 @@ async def open_terminal_session(
 
 @mcp.tool()
 async def open_vnc_session(
+    _track("open_vnc_session")
     node: str,
     vm_id: int,
     vm_type: str = "qemu",
@@ -289,6 +292,7 @@ async def open_vnc_session(
 
 @mcp.tool()
 async def get_vnc_ticket(
+    _track("get_vnc_ticket")
     node: str,
     vm_id: int,
     vm_type: str = "qemu",
@@ -369,6 +373,7 @@ async def get_vnc_ticket(
 
 @mcp.tool()
 async def enable_mock_mode(
+    _track("enable_mock_mode")
     uri: str,
     pve_version: str = "9x",
 ) -> dict:
@@ -409,6 +414,7 @@ async def disable_mock_mode() -> dict:
     Use this after finishing tests that used mock mode to ensure subsequent API
     calls go to the real Proxmox server.
     """
+    _track("disable_mock_mode")
     was_active = _connection_state.get("mock_mode", False)
     prev_version = _connection_state.get("mock_version")
 
@@ -427,6 +433,7 @@ async def disable_mock_mode() -> dict:
 
 @mcp.tool()
 async def query_proxmox_api(
+    _track("query_proxmox_api")
     method: str,
     endpoint: str,
     params: Optional[List[Dict[str, str]]] = None,
