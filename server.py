@@ -6,547 +6,542 @@ import threading
 from fastmcp import FastMCP
 import httpx
 import os
-import ssl
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 mcp = FastMCP("go-proxmox")
 
-# In-memory state for connection configuration
-_connection_config: dict = {}
-_mock_interceptors_active: bool = False
-_mock_version: str = ""
+# In-memory state for the connection configuration
+_connection_state: Dict[str, Any] = {
+    "uri": None,
+    "token_id": None,
+    "token_secret": None,
+    "mock_mode": False,
+    "mock_version": None,
+}
+
+# Mock data store for simulated responses
+_mock_responses: Dict[str, Any] = {}
+
+
+def _get_headers() -> Dict[str, str]:
+    """Build authentication headers from current connection state."""
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    token_id = _connection_state.get("token_id")
+    token_secret = _connection_state.get("token_secret")
+    if token_id and token_secret:
+        headers["Authorization"] = f"PVEAPIToken={token_id}={token_secret}"
+    return headers
+
+
+def _get_base_url() -> Optional[str]:
+    """Return the base API URL."""
+    uri = _connection_state.get("uri")
+    if not uri:
+        return None
+    return uri.rstrip("/") + "/api2/json"
+
+
+def _build_mock_data(version: str, uri: str) -> Dict[str, Any]:
+    """Build mock response data for a given PVE version."""
+    return {
+        "version": version,
+        "uri": uri,
+        "/nodes": {
+            "data": [
+                {
+                    "node": "pve",
+                    "status": "online",
+                    "cpu": 0.05,
+                    "maxcpu": 4,
+                    "mem": 2147483648,
+                    "maxmem": 8589934592,
+                    "disk": 10737418240,
+                    "maxdisk": 107374182400,
+                    "uptime": 86400,
+                    "type": "node",
+                    "id": "node/pve",
+                }
+            ]
+        },
+        "/version": {
+            "data": {
+                "version": version.replace("x", ".0"),
+                "release": version,
+                "repoid": "mock",
+            }
+        },
+        "/cluster/status": {
+            "data": [
+                {
+                    "type": "cluster",
+                    "name": "mock-cluster",
+                    "nodes": 1,
+                    "quorate": 1,
+                    "version": 2,
+                    "id": "cluster",
+                }
+            ]
+        },
+    }
 
 
 @mcp.tool()
 async def connect_proxmox(
     uri: str,
-    username: str,
-    password: str,
-    tls_insecure: bool = False
+    token_id: Optional[str] = None,
+    token_secret: Optional[str] = None,
 ) -> dict:
     """
     Initialize and configure a connection to a Proxmox VE server.
-    Use this first to establish the client with the server URI and credentials
-    before performing any operations. Supports Proxmox VE versions 6.x through 9.x.
+    Use this first to set up the client with the target Proxmox host URI
+    before performing any operations. This establishes the base configuration
+    used by all subsequent API calls.
     """
-    global _connection_config
+    _connection_state["uri"] = uri.rstrip("/")
+    _connection_state["token_id"] = token_id
+    _connection_state["token_secret"] = token_secret
 
-    # Store connection config
-    _connection_config = {
-        "uri": uri,
-        "username": username,
-        "tls_insecure": tls_insecure
+    result: Dict[str, Any] = {
+        "status": "configured",
+        "uri": _connection_state["uri"],
+        "auth_method": "api_token" if (token_id and token_secret) else "none",
+        "message": f"Connection configured for {uri}",
     }
 
-    # Build the API ticket endpoint
-    ticket_url = f"{uri.rstrip('/')}/api2/json/access/ticket"
-
-    try:
-        async with httpx.AsyncClient(verify=not tls_insecure, timeout=30.0) as client:
-            response = await client.post(
-                ticket_url,
-                data={
-                    "username": username,
-                    "password": password
-                }
-            )
-
-            if response.status_code == 200:
-                data = response.json()
-                ticket = data.get("data", {}).get("ticket", "")
-                csrf_token = data.get("data", {}).get("CSRFPreventionToken", "")
-
-                # Store auth tokens
-                _connection_config["ticket"] = ticket
-                _connection_config["csrf_token"] = csrf_token
-
-                return {
-                    "status": "connected",
-                    "uri": uri,
-                    "username": username,
-                    "tls_insecure": tls_insecure,
-                    "authenticated": True,
-                    "message": f"Successfully connected to Proxmox VE at {uri}"
-                }
-            else:
-                return {
-                    "status": "error",
-                    "uri": uri,
-                    "username": username,
-                    "authenticated": False,
-                    "http_status": response.status_code,
-                    "message": f"Authentication failed with HTTP {response.status_code}"
-                }
-    except httpx.ConnectError as e:
-        _connection_config = {
-            "uri": uri,
-            "username": username,
-            "tls_insecure": tls_insecure,
-            "configured": True
-        }
-        return {
-            "status": "configured",
-            "uri": uri,
-            "username": username,
-            "tls_insecure": tls_insecure,
-            "authenticated": False,
-            "message": f"Connection configured but server unreachable: {str(e)}. Configuration saved for mock/test use."
-        }
-    except Exception as e:
-        return {
-            "status": "error",
-            "uri": uri,
-            "username": username,
-            "authenticated": False,
-            "message": f"Failed to connect: {str(e)}"
-        }
-
-
-@mcp.tool()
-async def enable_mock_interceptors(
-    uri: str,
-    version: str = "9x"
-) -> dict:
-    """
-    Enable HTTP mock interceptors for testing against a specific Proxmox VE version
-    without a real server. Use this in test/development environments to simulate API
-    responses. Supports versions 6.x, 7.x, 8.x, and 9.x.
-    """
-    global _mock_interceptors_active, _mock_version, _connection_config
-
-    valid_versions = ["6x", "7x", "8x", "9x"]
-    if version not in valid_versions:
-        return {
-            "status": "error",
-            "message": f"Invalid version '{version}'. Valid values are: {', '.join(valid_versions)}"
-        }
-
-    _mock_interceptors_active = True
-    _mock_version = version
-    _connection_config["uri"] = uri
-    _connection_config["mock"] = True
-
-    version_map = {
-        "6x": "Proxmox VE 6.x",
-        "7x": "Proxmox VE 7.x",
-        "8x": "Proxmox VE 8.x",
-        "9x": "Proxmox VE 9.x"
-    }
-
-    return {
-        "status": "enabled",
-        "uri": uri,
-        "version": version,
-        "version_label": version_map[version],
-        "mock_active": True,
-        "message": f"Mock interceptors enabled for {version_map[version]} at {uri}. API calls will be simulated."
-    }
-
-
-@mcp.tool()
-async def disable_mock_interceptors() -> dict:
-    """
-    Disable and remove all active HTTP mock interceptors. Use this after testing
-    is complete to restore normal HTTP behavior and allow real API calls to proceed.
-    """
-    global _mock_interceptors_active, _mock_version
-
-    was_active = _mock_interceptors_active
-    previous_version = _mock_version
-
-    _mock_interceptors_active = False
-    _mock_version = ""
-
-    if _connection_config.get("mock"):
-        _connection_config.pop("mock", None)
-
-    if was_active:
-        return {
-            "status": "disabled",
-            "mock_active": False,
-            "previous_version": previous_version,
-            "message": f"Mock interceptors for version '{previous_version}' have been disabled. Real HTTP requests will now proceed normally."
-        }
+    # Try to verify connectivity if not in mock mode
+    if not _connection_state.get("mock_mode"):
+        base_url = _get_base_url()
+        if base_url:
+            try:
+                async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
+                    response = await client.get(
+                        f"{base_url}/version",
+                        headers=_get_headers(),
+                    )
+                    if response.status_code == 200:
+                        data = response.json()
+                        result["connection_test"] = "success"
+                        result["server_version"] = data.get("data", {})
+                    else:
+                        result["connection_test"] = "failed"
+                        result["http_status"] = response.status_code
+            except Exception as e:
+                result["connection_test"] = "error"
+                result["error"] = str(e)
     else:
-        return {
-            "status": "already_disabled",
-            "mock_active": False,
-            "message": "No active mock interceptors were found. Nothing to disable."
-        }
+        result["connection_test"] = "skipped (mock mode active)"
+
+    return result
 
 
 @mcp.tool()
 async def open_terminal_session(
     node: str,
-    vmid: int,
-    vm_type: str = "qemu"
+    vm_id: Optional[int] = None,
+    vm_type: str = "qemu",
 ) -> dict:
     """
-    Open a WebSocket-based terminal (xterm) session to a Proxmox node or VM.
-    Use this when you need interactive shell access to a virtual machine or
-    container over a secure WebSocket connection.
+    Open a WebSocket terminal (shell) session to a Proxmox VE node or VM.
+    Use this when you need interactive terminal access to a node or virtual
+    machine via the Proxmox terminal WebSocket endpoint.
     """
-    if not _connection_config.get("uri"):
+    uri = _connection_state.get("uri")
+    if not uri:
         return {
             "status": "error",
-            "message": "No Proxmox connection configured. Call connect_proxmox first."
+            "message": "Not connected. Please call connect_proxmox first.",
         }
 
-    uri = _connection_config["uri"].rstrip("/")
-    ticket = _connection_config.get("ticket", "")
-    csrf_token = _connection_config.get("csrf_token", "")
-    tls_insecure = _connection_config.get("tls_insecure", False)
-
-    if vm_type not in ["qemu", "lxc"]:
-        return {
-            "status": "error",
-            "message": f"Invalid vm_type '{vm_type}'. Must be 'qemu' or 'lxc'."
-        }
-
-    # Build the terminal proxy URL
-    if vm_type == "qemu":
-        term_url = f"{uri}/api2/json/nodes/{node}/qemu/{vmid}/terminal-proxy"
+    if vm_id is not None:
+        # VM-level terminal
+        if vm_type == "lxc":
+            api_path = f"/nodes/{node}/lxc/{vm_id}/terminal"
+            ws_path = f"/nodes/{node}/lxc/{vm_id}/vncwebsocket"
+        else:
+            api_path = f"/nodes/{node}/qemu/{vm_id}/terminal"
+            ws_path = f"/nodes/{node}/qemu/{vm_id}/vncwebsocket"
+        target = f"VM {vm_id} ({vm_type}) on node {node}"
     else:
-        term_url = f"{uri}/api2/json/nodes/{node}/lxc/{vmid}/terminal-proxy"
+        # Node-level shell
+        api_path = f"/nodes/{node}/termproxy"
+        ws_path = f"/nodes/{node}/vncwebsocket"
+        target = f"node {node}"
 
-    # If mock mode is active, return simulated response
-    if _mock_interceptors_active:
-        ws_url = f"wss://{uri.replace('https://', '').replace('http://', '')}/term?node={node}&vmid={vmid}&vmtype={vm_type}"
-        return {
-            "status": "success",
-            "mock": True,
-            "node": node,
-            "vmid": vmid,
-            "vm_type": vm_type,
-            "websocket_url": ws_url,
-            "proxy_url": term_url,
-            "ticket": "MOCK_TERMINAL_TICKET",
-            "port": 5900,
-            "message": f"Mock terminal session opened for {vm_type} VM {vmid} on node {node}"
-        }
+    base_url = _get_base_url()
+    result: Dict[str, Any] = {
+        "status": "initiated",
+        "target": target,
+        "node": node,
+        "vm_id": vm_id,
+        "vm_type": vm_type,
+        "api_path": api_path,
+        "websocket_path": ws_path,
+        "websocket_url": f"{uri}{ws_path}",
+    }
 
-    if not ticket:
-        return {
-            "status": "error",
-            "message": "Not authenticated. Please call connect_proxmox with valid credentials first."
-        }
+    if _connection_state.get("mock_mode"):
+        result["ticket"] = "mock-terminal-ticket-abc123"
+        result["port"] = 5900
+        result["upid"] = "UPID:pve:mock:terminal:mock"
+        result["message"] = f"Mock terminal session for {target}"
+        return result
 
     try:
-        async with httpx.AsyncClient(verify=not tls_insecure, timeout=30.0) as client:
+        async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
             response = await client.post(
-                term_url,
-                headers={
-                    "CSRFPreventionToken": csrf_token,
-                    "Cookie": f"PVEAuthCookie={ticket}"
-                }
+                f"{base_url}{api_path}",
+                headers=_get_headers(),
             )
-
-            if response.status_code == 200:
-                data = response.json().get("data", {})
-                port = data.get("port", 5900)
-                term_ticket = data.get("ticket", "")
-                upid = data.get("upid", "")
-
-                # Build WebSocket URL
-                ws_host = uri.replace("https://", "").replace("http://", "")
-                ws_url = f"wss://{ws_host}/api2/json/nodes/{node}/{vm_type}/{vmid}/vncwebsocket?port={port}&vncticket={term_ticket}"
-
-                return {
-                    "status": "success",
-                    "node": node,
-                    "vmid": vmid,
-                    "vm_type": vm_type,
-                    "websocket_url": ws_url,
-                    "proxy_url": term_url,
-                    "ticket": term_ticket,
-                    "port": port,
-                    "upid": upid,
-                    "message": f"Terminal session opened for {vm_type} VM {vmid} on node {node}. Connect via WebSocket: {ws_url}"
-                }
+            if response.status_code in (200, 201):
+                data = response.json()
+                result["ticket"] = data.get("data", {}).get("ticket")
+                result["port"] = data.get("data", {}).get("port")
+                result["upid"] = data.get("data", {}).get("upid")
+                result["message"] = f"Terminal session opened for {target}"
             else:
-                return {
-                    "status": "error",
-                    "http_status": response.status_code,
-                    "message": f"Failed to open terminal session: HTTP {response.status_code} - {response.text}"
-                }
+                result["status"] = "error"
+                result["http_status"] = response.status_code
+                result["message"] = response.text
     except Exception as e:
-        return {
-            "status": "error",
-            "message": f"Error opening terminal session: {str(e)}"
-        }
+        result["status"] = "error"
+        result["error"] = str(e)
+
+    return result
 
 
 @mcp.tool()
 async def open_vnc_session(
     node: str,
-    vmid: int,
-    vm_type: str = "qemu"
+    vm_id: int,
+    vm_type: str = "qemu",
 ) -> dict:
     """
-    Open a WebSocket-based VNC graphical console session to a Proxmox VM.
-    Use this when you need graphical desktop access to a virtual machine.
-    Returns a VNC proxy WebSocket connection.
+    Open a VNC WebSocket connection to a Proxmox VE virtual machine for
+    graphical console access. Use this when you need to access the graphical
+    display of a VM running on Proxmox.
     """
-    if not _connection_config.get("uri"):
+    uri = _connection_state.get("uri")
+    if not uri:
         return {
             "status": "error",
-            "message": "No Proxmox connection configured. Call connect_proxmox first."
+            "message": "Not connected. Please call connect_proxmox first.",
         }
 
-    uri = _connection_config["uri"].rstrip("/")
-    ticket = _connection_config.get("ticket", "")
-    csrf_token = _connection_config.get("csrf_token", "")
-    tls_insecure = _connection_config.get("tls_insecure", False)
-
-    if vm_type not in ["qemu", "lxc"]:
-        return {
-            "status": "error",
-            "message": f"Invalid vm_type '{vm_type}'. Must be 'qemu' or 'lxc'."
-        }
-
-    # Build the VNC proxy URL
-    if vm_type == "qemu":
-        vnc_url = f"{uri}/api2/json/nodes/{node}/qemu/{vmid}/vncproxy"
+    if vm_type == "lxc":
+        api_path = f"/nodes/{node}/lxc/{vm_id}/vncproxy"
+        ws_path = f"/nodes/{node}/lxc/{vm_id}/vncwebsocket"
     else:
-        vnc_url = f"{uri}/api2/json/nodes/{node}/lxc/{vmid}/vncproxy"
+        api_path = f"/nodes/{node}/qemu/{vm_id}/vncproxy"
+        ws_path = f"/nodes/{node}/qemu/{vm_id}/vncwebsocket"
 
-    # If mock mode is active, return simulated response
-    if _mock_interceptors_active:
-        ws_host = uri.replace("https://", "").replace("http://", "")
-        ws_url = f"wss://{ws_host}/vnc?node={node}&vmid={vmid}&vmtype={vm_type}"
-        return {
-            "status": "success",
-            "mock": True,
-            "node": node,
-            "vmid": vmid,
-            "vm_type": vm_type,
-            "websocket_url": ws_url,
-            "proxy_url": vnc_url,
-            "ticket": "MOCK_VNC_TICKET",
-            "port": 5900,
-            "cert": "MOCK_CERT",
-            "message": f"Mock VNC session opened for {vm_type} VM {vmid} on node {node}"
-        }
+    base_url = _get_base_url()
+    result: Dict[str, Any] = {
+        "status": "initiated",
+        "node": node,
+        "vm_id": vm_id,
+        "vm_type": vm_type,
+        "api_path": api_path,
+        "websocket_path": ws_path,
+        "websocket_url": f"{uri}{ws_path}",
+    }
 
-    if not ticket:
-        return {
-            "status": "error",
-            "message": "Not authenticated. Please call connect_proxmox with valid credentials first."
-        }
+    if _connection_state.get("mock_mode"):
+        result["ticket"] = "mock-vnc-ticket-xyz789"
+        result["port"] = 5901
+        result["cert"] = "mock-cert-fingerprint"
+        result["message"] = f"Mock VNC session for VM {vm_id} ({vm_type}) on node {node}"
+        return result
 
     try:
-        async with httpx.AsyncClient(verify=not tls_insecure, timeout=30.0) as client:
+        async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
             response = await client.post(
-                vnc_url,
-                headers={
-                    "CSRFPreventionToken": csrf_token,
-                    "Cookie": f"PVEAuthCookie={ticket}"
-                },
-                data={"websocket": 1}
+                f"{base_url}{api_path}",
+                headers=_get_headers(),
+                json={"websocket": 1},
             )
-
-            if response.status_code == 200:
-                data = response.json().get("data", {})
-                port = data.get("port", 5900)
-                vnc_ticket = data.get("ticket", "")
-                cert = data.get("cert", "")
-                upid = data.get("upid", "")
-
-                ws_host = uri.replace("https://", "").replace("http://", "")
-                ws_url = f"wss://{ws_host}/api2/json/nodes/{node}/{vm_type}/{vmid}/vncwebsocket?port={port}&vncticket={vnc_ticket}"
-
-                return {
-                    "status": "success",
-                    "node": node,
-                    "vmid": vmid,
-                    "vm_type": vm_type,
-                    "websocket_url": ws_url,
-                    "proxy_url": vnc_url,
-                    "ticket": vnc_ticket,
-                    "port": port,
-                    "cert": cert,
-                    "upid": upid,
-                    "message": f"VNC session opened for {vm_type} VM {vmid} on node {node}. Connect via WebSocket: {ws_url}"
-                }
+            if response.status_code in (200, 201):
+                data = response.json()
+                vnc_data = data.get("data", {})
+                result["ticket"] = vnc_data.get("ticket")
+                result["port"] = vnc_data.get("port")
+                result["cert"] = vnc_data.get("cert")
+                result["upid"] = vnc_data.get("upid")
+                # Build full websocket URL with ticket
+                ticket = vnc_data.get("ticket", "")
+                port = vnc_data.get("port", 5900)
+                result["vnc_websocket_url"] = (
+                    f"{uri}{ws_path}?port={port}&vncticket={ticket}"
+                )
+                result["message"] = f"VNC session opened for VM {vm_id} on node {node}"
             else:
-                return {
-                    "status": "error",
-                    "http_status": response.status_code,
-                    "message": f"Failed to open VNC session: HTTP {response.status_code} - {response.text}"
-                }
+                result["status"] = "error"
+                result["http_status"] = response.status_code
+                result["message"] = response.text
     except Exception as e:
-        return {
-            "status": "error",
-            "message": f"Error opening VNC session: {str(e)}"
-        }
+        result["status"] = "error"
+        result["error"] = str(e)
+
+    return result
 
 
 @mcp.tool()
 async def get_vnc_ticket(
     node: str,
-    vmid: int,
-    vm_type: str = "qemu"
+    vm_id: int,
+    vm_type: str = "qemu",
 ) -> dict:
     """
-    Retrieve a one-time VNC authentication ticket for a Proxmox VM.
-    Use this before establishing a VNC connection to obtain the temporary ticket
-    required for authentication with the VNC proxy.
+    Retrieve a VNC ticket for a Proxmox VM to use with a VNC client for
+    authentication. Use this before establishing a VNC connection when a
+    short-lived authentication ticket is required.
     """
-    if not _connection_config.get("uri"):
+    uri = _connection_state.get("uri")
+    if not uri:
         return {
             "status": "error",
-            "message": "No Proxmox connection configured. Call connect_proxmox first."
+            "message": "Not connected. Please call connect_proxmox first.",
         }
 
-    uri = _connection_config["uri"].rstrip("/")
-    ticket = _connection_config.get("ticket", "")
-    csrf_token = _connection_config.get("csrf_token", "")
-    tls_insecure = _connection_config.get("tls_insecure", False)
-
-    if vm_type not in ["qemu", "lxc"]:
-        return {
-            "status": "error",
-            "message": f"Invalid vm_type '{vm_type}'. Must be 'qemu' or 'lxc'."
-        }
-
-    # If mock mode is active, return simulated ticket
-    if _mock_interceptors_active:
-        return {
-            "status": "success",
-            "mock": True,
-            "node": node,
-            "vmid": vmid,
-            "vm_type": vm_type,
-            "ticket": f"MOCK_VNC_TICKET_{node}_{vmid}",
-            "port": 5900,
-            "cert": "MOCK_CERTIFICATE_DATA",
-            "message": f"Mock VNC ticket generated for {vm_type} VM {vmid} on node {node}"
-        }
-
-    if not ticket:
-        return {
-            "status": "error",
-            "message": "Not authenticated. Please call connect_proxmox with valid credentials first."
-        }
-
-    # Build the VNC proxy URL to get a ticket
-    if vm_type == "qemu":
-        vnc_url = f"{uri}/api2/json/nodes/{node}/qemu/{vmid}/vncproxy"
+    if vm_type == "lxc":
+        api_path = f"/nodes/{node}/lxc/{vm_id}/vncproxy"
     else:
-        vnc_url = f"{uri}/api2/json/nodes/{node}/lxc/{vmid}/vncproxy"
+        api_path = f"/nodes/{node}/qemu/{vm_id}/vncproxy"
+
+    base_url = _get_base_url()
+    result: Dict[str, Any] = {
+        "status": "pending",
+        "node": node,
+        "vm_id": vm_id,
+        "vm_type": vm_type,
+        "api_path": api_path,
+    }
+
+    if _connection_state.get("mock_mode"):
+        result["status"] = "success"
+        result["ticket"] = "PVE:mock@pam:mock-ticket-token"
+        result["port"] = 5900
+        result["cert"] = "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99"
+        result["message"] = f"Mock VNC ticket for VM {vm_id} ({vm_type}) on node {node}"
+        result["usage"] = {
+            "vnc_host": uri.replace("https://", "").replace("http://", "").split(":")[0],
+            "vnc_port": 5900,
+            "vnc_password": result["ticket"],
+        }
+        return result
 
     try:
-        async with httpx.AsyncClient(verify=not tls_insecure, timeout=30.0) as client:
+        async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
             response = await client.post(
-                vnc_url,
-                headers={
-                    "CSRFPreventionToken": csrf_token,
-                    "Cookie": f"PVEAuthCookie={ticket}"
-                },
-                data={"websocket": 1, "generate-password": 1}
+                f"{base_url}{api_path}",
+                headers=_get_headers(),
+                json={"websocket": 0},
             )
-
-            if response.status_code == 200:
-                data = response.json().get("data", {})
-                vnc_ticket = data.get("ticket", "")
-                port = data.get("port", 5900)
-                cert = data.get("cert", "")
-
-                return {
-                    "status": "success",
-                    "node": node,
-                    "vmid": vmid,
-                    "vm_type": vm_type,
-                    "ticket": vnc_ticket,
-                    "port": port,
-                    "cert": cert,
-                    "message": f"VNC ticket retrieved for {vm_type} VM {vmid} on node {node}. Use this ticket to authenticate your VNC connection."
+            if response.status_code in (200, 201):
+                data = response.json()
+                vnc_data = data.get("data", {})
+                ticket = vnc_data.get("ticket", "")
+                port = vnc_data.get("port", 5900)
+                host = uri.replace("https://", "").replace("http://", "").split(":")[0]
+                result["status"] = "success"
+                result["ticket"] = ticket
+                result["port"] = port
+                result["cert"] = vnc_data.get("cert")
+                result["message"] = f"VNC ticket obtained for VM {vm_id} on node {node}"
+                result["usage"] = {
+                    "vnc_host": host,
+                    "vnc_port": port,
+                    "vnc_password": ticket,
+                    "hint": "Use this ticket as the VNC password. Tickets are short-lived.",
                 }
             else:
-                return {
-                    "status": "error",
-                    "http_status": response.status_code,
-                    "message": f"Failed to get VNC ticket: HTTP {response.status_code} - {response.text}"
-                }
+                result["status"] = "error"
+                result["http_status"] = response.status_code
+                result["message"] = response.text
     except Exception as e:
-        return {
-            "status": "error",
-            "message": f"Error retrieving VNC ticket: {str(e)}"
-        }
+        result["status"] = "error"
+        result["error"] = str(e)
+
+    return result
 
 
 @mcp.tool()
-async def start_console_server(
-    proxmox_uri: str,
-    port: int = 8523,
-    cert_file: str = "server.crt",
-    key_file: str = "server.key"
+async def enable_mock_mode(
+    uri: str,
+    pve_version: str = "9x",
 ) -> dict:
     """
-    Start the local HTTPS proxy server that bridges WebSocket terminal and VNC connections
-    between a browser client and the Proxmox API. Use this to set up the term-and-vnc
-    example server with TLS, required before opening terminal or VNC sessions via the web interface.
+    Enable HTTP mock interception for testing against a simulated Proxmox VE
+    environment without a real server. Use this during development or testing
+    to load mock responses for a specific Proxmox VE version. Useful for
+    unit tests and CI pipelines.
     """
-    # Validate the proxmox_uri
-    if not proxmox_uri:
-        proxmox_uri = os.environ.get("PROXMOX_URI", "")
-        if not proxmox_uri:
-            return {
-                "status": "error",
-                "message": "proxmox_uri is required. Provide it directly or set the PROXMOX_URI environment variable."
-            }
-
-    # Check if port is valid
-    if not (1 <= port <= 65535):
+    valid_versions = ["6x", "7x", "8x", "9x"]
+    if pve_version not in valid_versions:
         return {
             "status": "error",
-            "message": f"Invalid port {port}. Must be between 1 and 65535."
+            "message": f"Invalid pve_version '{pve_version}'. Must be one of: {valid_versions}",
         }
 
-    # Check cert and key files existence
-    cert_exists = os.path.isfile(cert_file)
-    key_exists = os.path.isfile(key_file)
+    _connection_state["uri"] = uri.rstrip("/")
+    _connection_state["mock_mode"] = True
+    _connection_state["mock_version"] = pve_version
+    _mock_responses.clear()
+    _mock_responses.update(_build_mock_data(pve_version, uri))
 
-    server_config = {
-        "status": "configured",
-        "proxmox_uri": proxmox_uri,
-        "server_port": port,
-        "cert_file": cert_file,
-        "key_file": key_file,
-        "cert_file_found": cert_exists,
-        "key_file_found": key_exists,
-        "routes": [
-            {"method": "GET", "path": "/", "description": "Health check - returns hello world"},
-            {"method": "GET", "path": "/term", "description": "WebSocket terminal (xterm) handler"},
-            {"method": "GET", "path": "/vnc", "description": "WebSocket VNC console handler"},
-            {"method": "GET", "path": "/vnc-ticket", "description": "VNC ticket retrieval endpoint"}
-        ],
-        "server_url": f"https://localhost:{port}",
-        "term_endpoint": f"https://localhost:{port}/term",
-        "vnc_endpoint": f"https://localhost:{port}/vnc",
-        "vnc_ticket_endpoint": f"https://localhost:{port}/vnc-ticket"
+    return {
+        "status": "enabled",
+        "mock_mode": True,
+        "pve_version": pve_version,
+        "uri": uri,
+        "message": f"Mock mode enabled for Proxmox VE {pve_version} at {uri}",
+        "available_mock_endpoints": list(_mock_responses.keys()),
+        "note": "All API calls will return simulated responses. No real server is contacted.",
     }
 
-    if not cert_exists or not key_exists:
-        missing = []
-        if not cert_exists:
-            missing.append(f"cert file '{cert_file}'")
-        if not key_exists:
-            missing.append(f"key file '{key_file}'")
-        server_config["status"] = "warning"
-        server_config["message"] = (
-            f"Console server configuration ready for Proxmox at {proxmox_uri} on port {port}, "
-            f"but TLS files are missing: {', '.join(missing)}. "
-            f"Generate them with: openssl req -x509 -newkey rsa:4096 -keyout {key_file} -out {cert_file} -days 365 -nodes"
-        )
-    else:
-        server_config["message"] = (
-            f"Console proxy server is configured to run on port {port} with TLS, "
-            f"proxying to Proxmox VE at {proxmox_uri}. "
-            f"The server bridges browser WebSocket connections to the Proxmox API for terminal and VNC sessions."
-        )
 
-    return server_config
+@mcp.tool()
+async def disable_mock_mode() -> dict:
+    """
+    Disable all active HTTP mock interceptors and restore real HTTP communication.
+    Use this after finishing tests that used mock mode to ensure subsequent API
+    calls go to the real Proxmox server.
+    """
+    was_active = _connection_state.get("mock_mode", False)
+    prev_version = _connection_state.get("mock_version")
+
+    _connection_state["mock_mode"] = False
+    _connection_state["mock_version"] = None
+    _mock_responses.clear()
+
+    return {
+        "status": "disabled",
+        "mock_mode": False,
+        "was_active": was_active,
+        "previous_version": prev_version,
+        "message": "Mock mode disabled. Subsequent API calls will target the real Proxmox server.",
+    }
+
+
+@mcp.tool()
+async def query_proxmox_api(
+    method: str,
+    endpoint: str,
+    params: Optional[List[Dict[str, str]]] = None,
+) -> dict:
+    """
+    Execute a raw API call against the Proxmox VE /api2/json REST API.
+    Use this for any Proxmox operation not covered by dedicated tools, such as
+    querying nodes, VMs, storage, tasks, or cluster status. Supports GET, POST,
+    PUT, and DELETE methods.
+    """
+    uri = _connection_state.get("uri")
+    if not uri:
+        return {
+            "status": "error",
+            "message": "Not connected. Please call connect_proxmox first.",
+        }
+
+    method = method.upper()
+    if method not in ("GET", "POST", "PUT", "DELETE"):
+        return {
+            "status": "error",
+            "message": f"Invalid HTTP method '{method}'. Must be GET, POST, PUT, or DELETE.",
+        }
+
+    # Normalize endpoint
+    if not endpoint.startswith("/"):
+        endpoint = "/" + endpoint
+
+    # Convert params list to dict
+    params_dict: Dict[str, str] = {}
+    if params:
+        for item in params:
+            if isinstance(item, dict) and "key" in item and "value" in item:
+                params_dict[str(item["key"])] = str(item["value"])
+
+    # Handle mock mode
+    if _connection_state.get("mock_mode"):
+        mock_key = endpoint
+        if mock_key in _mock_responses:
+            return {
+                "status": "success",
+                "method": method,
+                "endpoint": endpoint,
+                "mock_mode": True,
+                "data": _mock_responses[mock_key],
+            }
+        else:
+            return {
+                "status": "success",
+                "method": method,
+                "endpoint": endpoint,
+                "mock_mode": True,
+                "data": {"data": [], "message": f"Mock response for {endpoint} (no specific mock data)"},
+            }
+
+    base_url = _get_base_url()
+    full_url = f"{base_url}{endpoint}"
+
+    result: Dict[str, Any] = {
+        "method": method,
+        "endpoint": endpoint,
+        "url": full_url,
+        "params": params_dict,
+    }
+
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=30.0) as client:
+            headers = _get_headers()
+
+            if method == "GET":
+                response = await client.get(
+                    full_url,
+                    headers=headers,
+                    params=params_dict if params_dict else None,
+                )
+            elif method == "POST":
+                response = await client.post(
+                    full_url,
+                    headers=headers,
+                    json=params_dict if params_dict else None,
+                )
+            elif method == "PUT":
+                response = await client.put(
+                    full_url,
+                    headers=headers,
+                    json=params_dict if params_dict else None,
+                )
+            elif method == "DELETE":
+                response = await client.delete(
+                    full_url,
+                    headers=headers,
+                    params=params_dict if params_dict else None,
+                )
+
+            result["http_status"] = response.status_code
+            result["headers"] = dict(response.headers)
+
+            try:
+                result["data"] = response.json()
+                result["status"] = "success" if response.status_code < 400 else "error"
+            except Exception:
+                result["data"] = response.text
+                result["status"] = "success" if response.status_code < 400 else "error"
+
+    except httpx.ConnectError as e:
+        result["status"] = "error"
+        result["error"] = f"Connection error: {str(e)}"
+    except httpx.TimeoutException as e:
+        result["status"] = "error"
+        result["error"] = f"Request timed out: {str(e)}"
+    except Exception as e:
+        result["status"] = "error"
+        result["error"] = str(e)
+
+    return result
 
 
 
